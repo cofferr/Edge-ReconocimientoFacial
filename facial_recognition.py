@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime
 
 import cv2
@@ -11,7 +12,13 @@ from PIL import Image, ImageTk
 # Configuracion
 # ---------------------------------------------------------------------------
 
-URL_CAMARA = 'http://10.62.82.181/320x240.mjpeg'
+DISPOSITIVOS_CAMARA = {
+    'Camara Local': 0,
+    'Camara ESP32': 'http://10.62.82.181/320x240.mjpeg',
+    'Camara Celular (DroidCam)': 'http://10.160.128.141:4747/video',
+}
+DISPOSITIVO_INICIAL = 'Camara Local'
+
 CARPETA_ROSTROS = 'rostros_conocidos'
 EXTENSIONES_VALIDAS = ('.jpg', '.png')
 ARCHIVO_REGISTRO_ACCESOS = 'registro_accesos.txt'
@@ -53,11 +60,10 @@ def cargar_rostros_conocidos(carpeta):
 # Reconocimiento facial
 # ---------------------------------------------------------------------------
 
-def detectar_rostros(frame_pequeno):
-    """Devuelve (ubicaciones, encodings) de los rostros en un frame reducido."""
-    rgb_frame = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2RGB)
-    ubicaciones = face_recognition.face_locations(rgb_frame)
-    encodings = face_recognition.face_encodings(rgb_frame, ubicaciones)
+def detectar_rostros(rgb_frame_pequeno):
+    """Devuelve (ubicaciones, encodings) de los rostros en un frame RGB reducido."""
+    ubicaciones = face_recognition.face_locations(rgb_frame_pequeno)
+    encodings = face_recognition.face_encodings(rgb_frame_pequeno, ubicaciones)
     return ubicaciones, encodings
 
 
@@ -155,57 +161,106 @@ def frame_a_imagen_tk(frame):
 # ---------------------------------------------------------------------------
 
 class EstadoApp:
+    """
+    Guarda el estado compartido entre el hilo principal (dibuja el video y
+    atiende la UI) y el hilo de reconocimiento (calcula ubicaciones/nombres
+    en segundo plano para no congelar Tkinter).
+    """
+
     def __init__(self, carpeta_rostros, registro_accesos):
         self.nombres_conocidos, self.encodings_conocidos = cargar_rostros_conocidos(carpeta_rostros)
         self.registro_accesos = registro_accesos
-        self.procesar_frame = True
         self.ubicaciones_rostros = []
         self.nombres_rostros = []
         self.ultimo_frame_leido = None
 
-    def registrar_rostro(self, nombre, encoding):
-        self.nombres_conocidos.append(nombre)
-        self.encodings_conocidos.append(encoding)
+        self._lock = threading.Lock()
+        self._reconociendo = False
 
-    def actualizar_deteccion(self, ubicaciones, nombres):
-        self.ubicaciones_rostros = ubicaciones
-        self.nombres_rostros = nombres
+    def registrar_rostro(self, nombre, encoding):
+        with self._lock:
+            self.nombres_conocidos.append(nombre)
+            self.encodings_conocidos.append(encoding)
+
+    def obtener_deteccion_actual(self):
+        with self._lock:
+            return list(self.ubicaciones_rostros), list(self.nombres_rostros)
+
+    def _actualizar_deteccion(self, ubicaciones, nombres):
+        with self._lock:
+            self.ubicaciones_rostros = ubicaciones
+            self.nombres_rostros = nombres
         for nombre in nombres:
             self.registro_accesos.registrar(nombre)
 
-    def alternar_procesamiento(self):
-        self.procesar_frame = not self.procesar_frame
+    def lanzar_reconocimiento_si_libre(self, frame_pequeno):
+        """Lanza el calculo de reconocimiento en un hilo aparte, solo si no hay
+        uno corriendo ya (evita acumular hilos si el calculo es mas lento que
+        la tasa de frames)."""
+        with self._lock:
+            if self._reconociendo:
+                return
+            self._reconociendo = True
+            nombres_conocidos = list(self.nombres_conocidos)
+            encodings_conocidos = list(self.encodings_conocidos)
+
+        hilo = threading.Thread(
+            target=self._tarea_reconocimiento,
+            args=(frame_pequeno, nombres_conocidos, encodings_conocidos),
+            daemon=True,
+        )
+        hilo.start()
+
+    def _tarea_reconocimiento(self, frame_pequeno, nombres_conocidos, encodings_conocidos):
+        ubicaciones, encodings = detectar_rostros(frame_pequeno)
+        nombres = identificar_rostros(encodings, nombres_conocidos, encodings_conocidos)
+        self._actualizar_deteccion(ubicaciones, nombres)
+        with self._lock:
+            self._reconociendo = False
 
 
 # ---------------------------------------------------------------------------
 # Logica de camara / video
 # ---------------------------------------------------------------------------
 
-def abrir_camara(url):
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+def es_fuente_local(fuente):
+    """Las camaras locales se identifican por indice (int); las de red, por URL (str)."""
+    return isinstance(fuente, int)
+
+
+def abrir_camara(fuente):
+    if es_fuente_local(fuente):
+        cap = cv2.VideoCapture(fuente)
+    else:
+        cap = cv2.VideoCapture(fuente, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
-def asegurar_camara_abierta(cap, url):
-    if not cap.isOpened():
-        cap.open(url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+def asegurar_camara_abierta(cap, fuente):
+    if cap.isOpened():
+        return
+    if es_fuente_local(fuente):
+        cap.open(fuente)
+    else:
+        cap.open(fuente, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
 def procesar_frame_video(frame, estado):
-    """Actualiza el estado de deteccion (solo en frames alternos) y devuelve el frame dibujado."""
+    """
+    Lanza el reconocimiento facial en segundo plano (si no hay uno corriendo) y
+    dibuja sobre el frame la ultima deteccion disponible. Nunca bloquea el
+    hilo que la llama: el calculo pesado ocurre en un hilo aparte.
+    """
     estado.ultimo_frame_leido = frame.copy()
 
-    if estado.procesar_frame:
-        frame_pequeno = cv2.resize(frame, (0, 0), fx=FACTOR_REDUCCION, fy=FACTOR_REDUCCION)
-        ubicaciones, encodings = detectar_rostros(frame_pequeno)
-        nombres = identificar_rostros(encodings, estado.nombres_conocidos, estado.encodings_conocidos)
-        estado.actualizar_deteccion(ubicaciones, nombres)
+    frame_pequeno = cv2.resize(frame, (0, 0), fx=FACTOR_REDUCCION, fy=FACTOR_REDUCCION)
+    rgb_frame_pequeno = cv2.cvtColor(frame_pequeno, cv2.COLOR_BGR2RGB)
+    estado.lanzar_reconocimiento_si_libre(rgb_frame_pequeno)
 
-    estado.alternar_procesamiento()
-
-    dibujar_rostros(frame, estado.ubicaciones_rostros, estado.nombres_rostros)
+    ubicaciones, nombres = estado.obtener_deteccion_actual()
+    dibujar_rostros(frame, ubicaciones, nombres)
     return frame
 
 
@@ -240,10 +295,11 @@ def capturar_rostro(nombre, frame, carpeta_rostros):
 # ---------------------------------------------------------------------------
 
 class VentanaPrincipal:
-    def __init__(self, root, cap, estado):
+    def __init__(self, root, estado, dispositivo_inicial):
         self.root = root
-        self.cap = cap
         self.estado = estado
+        self.dispositivo_actual = StringVar(value=dispositivo_inicial)
+        self.cap = abrir_camara(DISPOSITIVOS_CAMARA[dispositivo_inicial])
 
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
         root.title("ESPCAMP Facial Recognition")
@@ -251,21 +307,54 @@ class VentanaPrincipal:
         self.label_video = Label(root)
         self.label_video.grid(row=0, column=0, columnspan=2)
 
+        frame_dispositivo = Frame(root)
+        frame_dispositivo.grid(row=1, column=0, columnspan=2, pady=(12, 0))
+
+        Label(frame_dispositivo, text="Dispositivo de camara: ").pack(side=LEFT, padx=7)
+
+        self.botones_dispositivo = {}
+        for nombre_dispositivo in DISPOSITIVOS_CAMARA:
+            boton = Button(
+                frame_dispositivo, text=nombre_dispositivo,
+                command=lambda n=nombre_dispositivo: self.on_cambiar_dispositivo(n),
+            )
+            boton.pack(side=LEFT, padx=4)
+            self.botones_dispositivo[nombre_dispositivo] = boton
+
+        self._resaltar_boton_dispositivo(dispositivo_inicial)
+
         frame_controls = Frame(root)
-        frame_controls.grid(row=1, column=1, columnspan=2, pady=12)
+        frame_controls.grid(row=2, column=0, columnspan=2, pady=12)
 
         Label(frame_controls, text="Ingresar nombre del usuario: ").pack(side=LEFT, padx=7)
 
         self.entry_nombre = Entry(frame_controls, width=20)
         self.entry_nombre.pack(side=LEFT, padx=7)
 
-        Button(frame_controls, text="Captura Rosto", command=self.on_capturar_rostro).pack(side=LEFT, padx=7)
+        self.btn_capturar = Button(frame_controls, text="Captura Rosto", command=self.on_capturar_rostro)
+        self.btn_capturar.pack(side=LEFT, padx=7)
 
         self.label_estado = Label(root, text="")
-        self.label_estado.grid(row=2, column=0, columnspan=2)
+        self.label_estado.grid(row=3, column=0, columnspan=2)
 
     def mostrar_estado(self, texto, color):
         self.label_estado.configure(text=texto, fg=color)
+
+    def _resaltar_boton_dispositivo(self, nombre_dispositivo):
+        for nombre, boton in self.botones_dispositivo.items():
+            if nombre == nombre_dispositivo:
+                boton.configure(relief=SUNKEN, bg="#cfe8ff")
+            else:
+                boton.configure(relief=RAISED, bg="SystemButtonFace")
+
+    def on_cambiar_dispositivo(self, nombre_dispositivo):
+        self.dispositivo_actual.set(nombre_dispositivo)
+        self._resaltar_boton_dispositivo(nombre_dispositivo)
+
+        self.cap.release()
+        self.cap = abrir_camara(DISPOSITIVOS_CAMARA[nombre_dispositivo])
+        self.estado.ultimo_frame_leido = None
+        self.mostrar_estado(f"Conectando a '{nombre_dispositivo}'...", "black")
 
     def on_capturar_rostro(self):
         nombre = self.entry_nombre.get().strip()
@@ -276,7 +365,23 @@ class VentanaPrincipal:
             self.mostrar_estado("Todavia no hay imagen de la camara", "red")
             return
 
-        encoding, error = capturar_rostro(nombre, self.estado.ultimo_frame_leido, CARPETA_ROSTROS)
+        frame_a_procesar = self.estado.ultimo_frame_leido.copy()
+        self.btn_capturar.configure(state=DISABLED)
+        self.mostrar_estado("Procesando...", "black")
+
+        threading.Thread(
+            target=self._tarea_capturar_rostro,
+            args=(nombre, frame_a_procesar),
+            daemon=True,
+        ).start()
+
+    def _tarea_capturar_rostro(self, nombre, frame):
+        encoding, error = capturar_rostro(nombre, frame, CARPETA_ROSTROS)
+        self.root.after(0, self._finalizar_captura_rostro, nombre, encoding, error)
+
+    def _finalizar_captura_rostro(self, nombre, encoding, error):
+        self.btn_capturar.configure(state=NORMAL)
+
         if error:
             self.mostrar_estado(error, "red")
             return
@@ -286,7 +391,8 @@ class VentanaPrincipal:
         self.mostrar_estado(f"Rostro de '{nombre}' registrado correctamente", "green")
 
     def actualizar_video(self):
-        asegurar_camara_abierta(self.cap, URL_CAMARA)
+        fuente_actual = DISPOSITIVOS_CAMARA[self.dispositivo_actual.get()]
+        asegurar_camara_abierta(self.cap, fuente_actual)
 
         ret, frame = self.cap.read()
         if ret:
@@ -311,10 +417,9 @@ class VentanaPrincipal:
 def main():
     registro_accesos = RegistroAccesos(ARCHIVO_REGISTRO_ACCESOS, SEGUNDOS_ENTRE_REGISTROS)
     estado = EstadoApp(CARPETA_ROSTROS, registro_accesos)
-    cap = abrir_camara(URL_CAMARA)
 
     root = Tk()
-    ventana = VentanaPrincipal(root, cap, estado)
+    ventana = VentanaPrincipal(root, estado, DISPOSITIVO_INICIAL)
 
     root.after(1, ventana.actualizar_video)
     root.mainloop()
