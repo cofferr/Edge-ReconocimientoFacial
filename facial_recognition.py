@@ -14,8 +14,8 @@ from PIL import Image, ImageTk
 
 DISPOSITIVOS_CAMARA = {
     'Camara Local': 0,
-    'Camara ESP32': 'http://10.62.82.181/320x240.mjpeg',
-    'Camara Celular (DroidCam)': 'http://10.160.128.141:4747/video',
+    'Camara ESP32': 'http://10.62.82.181/640x480.mjpeg',
+    'Camara Celular (DroidCam)': 'http://10.62.82.32:4747/video',
 }
 DISPOSITIVO_INICIAL = 'Camara Local'
 
@@ -31,6 +31,12 @@ TAMANO_MINIATURA = (640, 480)    # tamano maximo mostrado en la ventana
 COLOR_CONOCIDO = (0, 255, 0)
 COLOR_DESCONOCIDO = (0, 0, 255)
 NOMBRE_DESCONOCIDO = 'Rostro Desconocido'
+
+# OpenCV (backend FFmpeg) y dlib/face_recognition no son completamente thread-safe:
+# abrir/cerrar una VideoCapture en un hilo mientras otro ejecuta reconocimiento facial
+# puede corromper memoria nativa y causar un segmentation fault. Este lock serializa
+# TODAS las llamadas a esas bibliotecas entre los distintos hilos de la app.
+LOCK_VISION = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +68,9 @@ def cargar_rostros_conocidos(carpeta):
 
 def detectar_rostros(rgb_frame_pequeno):
     """Devuelve (ubicaciones, encodings) de los rostros en un frame RGB reducido."""
-    ubicaciones = face_recognition.face_locations(rgb_frame_pequeno)
-    encodings = face_recognition.face_encodings(rgb_frame_pequeno, ubicaciones)
+    with LOCK_VISION:
+        ubicaciones = face_recognition.face_locations(rgb_frame_pequeno)
+        encodings = face_recognition.face_encodings(rgb_frame_pequeno, ubicaciones)
     return ubicaciones, encodings
 
 
@@ -72,10 +79,11 @@ def identificar_encoding(encoding_rostro, nombres_conocidos, encodings_conocidos
     if not encodings_conocidos:
         return NOMBRE_DESCONOCIDO
 
-    coincidencias = face_recognition.compare_faces(
-        encodings_conocidos, encoding_rostro, tolerance=TOLERANCIA_COINCIDENCIA
-    )
-    distancias = face_recognition.face_distance(encodings_conocidos, encoding_rostro)
+    with LOCK_VISION:
+        coincidencias = face_recognition.compare_faces(
+            encodings_conocidos, encoding_rostro, tolerance=TOLERANCIA_COINCIDENCIA
+        )
+        distancias = face_recognition.face_distance(encodings_conocidos, encoding_rostro)
     mejor_indice = np.argmin(distancias)
 
     if coincidencias[mejor_indice]:
@@ -229,23 +237,18 @@ def es_fuente_local(fuente):
 
 
 def abrir_camara(fuente):
-    if es_fuente_local(fuente):
-        cap = cv2.VideoCapture(fuente)
-    else:
-        cap = cv2.VideoCapture(fuente, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    with LOCK_VISION:
+        if es_fuente_local(fuente):
+            cap = cv2.VideoCapture(fuente)
+        else:
+            cap = cv2.VideoCapture(fuente, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
-def asegurar_camara_abierta(cap, fuente):
-    if cap.isOpened():
-        return
-    if es_fuente_local(fuente):
-        cap.open(fuente)
-    else:
-        cap.open(fuente, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
+def liberar_camara(cap):
+    with LOCK_VISION:
+        cap.release()
 
 def procesar_frame_video(frame, estado):
     """
@@ -275,14 +278,15 @@ def capturar_rostro(nombre, frame, carpeta_rostros):
     y el frame ya quedo guardado en disco.
     """
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    ubicaciones = face_recognition.face_locations(rgb_frame)
+    with LOCK_VISION:
+        ubicaciones = face_recognition.face_locations(rgb_frame)
 
-    if not ubicaciones:
-        return None, "No se detecto ningun rostro, acercate o mejora la luz"
-    if len(ubicaciones) > 1:
-        return None, "Se detecto mas de un rostro, debe haber solo uno"
+        if not ubicaciones:
+            return None, "No se detecto ningun rostro, acercate o mejora la luz"
+        if len(ubicaciones) > 1:
+            return None, "Se detecto mas de un rostro, debe haber solo uno"
 
-    encoding = face_recognition.face_encodings(rgb_frame, ubicaciones)[0]
+        encoding = face_recognition.face_encodings(rgb_frame, ubicaciones)[0]
 
     ruta = os.path.join(carpeta_rostros, f'{nombre}.jpg')
     cv2.imwrite(ruta, frame)
@@ -299,7 +303,9 @@ class VentanaPrincipal:
         self.root = root
         self.estado = estado
         self.dispositivo_actual = StringVar(value=dispositivo_inicial)
-        self.cap = abrir_camara(DISPOSITIVOS_CAMARA[dispositivo_inicial])
+        self.cap = None
+        self.conectando = False
+        self.id_conexion_vigente = 0  # descarta resultados de conexiones viejas al cambiar de dispositivo
 
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
         root.title("ESPCAMP Facial Recognition")
@@ -337,6 +343,8 @@ class VentanaPrincipal:
         self.label_estado = Label(root, text="")
         self.label_estado.grid(row=3, column=0, columnspan=2)
 
+        self._conectar_dispositivo(dispositivo_inicial)
+
     def mostrar_estado(self, texto, color):
         self.label_estado.configure(text=texto, fg=color)
 
@@ -350,11 +358,58 @@ class VentanaPrincipal:
     def on_cambiar_dispositivo(self, nombre_dispositivo):
         self.dispositivo_actual.set(nombre_dispositivo)
         self._resaltar_boton_dispositivo(nombre_dispositivo)
+        self._conectar_dispositivo(nombre_dispositivo)
 
-        self.cap.release()
-        self.cap = abrir_camara(DISPOSITIVOS_CAMARA[nombre_dispositivo])
+    def _conectar_dispositivo(self, nombre_dispositivo):
+        """
+        Abre la camara en un hilo de fondo para no bloquear la UI: conectar a
+        una URL de red que no responde puede tardar varios segundos en hacer
+        timeout, y eso no debe congelar la ventana ni el resto de los botones.
+        """
+        if self.cap is not None:
+            liberar_camara(self.cap)
+            self.cap = None
+
         self.estado.ultimo_frame_leido = None
+        self.conectando = True
+        self.id_conexion_vigente += 1
+        id_conexion = self.id_conexion_vigente
+
         self.mostrar_estado(f"Conectando a '{nombre_dispositivo}'...", "black")
+
+        threading.Thread(
+            target=self._tarea_conectar,
+            args=(nombre_dispositivo, id_conexion),
+            daemon=True,
+        ).start()
+
+    def _tarea_conectar(self, nombre_dispositivo, id_conexion):
+        fuente = DISPOSITIVOS_CAMARA[nombre_dispositivo]
+        cap = abrir_camara(fuente)
+        conectada = cap.isOpened()
+        if not conectada:
+            liberar_camara(cap)
+            cap = None
+        self.root.after(0, self._finalizar_conexion, nombre_dispositivo, id_conexion, cap, conectada)
+
+    def _finalizar_conexion(self, nombre_dispositivo, id_conexion, cap, conectada):
+        if id_conexion != self.id_conexion_vigente:
+            # el usuario ya selecciono otro dispositivo mientras este intentaba conectar
+            if cap is not None:
+                liberar_camara(cap)
+            return
+
+        self.conectando = False
+
+        if not conectada:
+            self.mostrar_estado(
+                f"No se pudo conectar a '{nombre_dispositivo}'. Revisa la conexion e intenta de nuevo.",
+                "red",
+            )
+            return
+
+        self.cap = cap
+        self.mostrar_estado(f"Conectado a '{nombre_dispositivo}'", "green")
 
     def on_capturar_rostro(self):
         nombre = self.entry_nombre.get().strip()
@@ -391,22 +446,33 @@ class VentanaPrincipal:
         self.mostrar_estado(f"Rostro de '{nombre}' registrado correctamente", "green")
 
     def actualizar_video(self):
-        fuente_actual = DISPOSITIVOS_CAMARA[self.dispositivo_actual.get()]
-        asegurar_camara_abierta(self.cap, fuente_actual)
+        if self.cap is None:
+            self.root.after(1, self.actualizar_video)
+            return
 
-        ret, frame = self.cap.read()
+        with LOCK_VISION:
+            ret, frame = self.cap.read()
+
         if ret:
             frame = procesar_frame_video(frame, self.estado)
             tkimage = frame_a_imagen_tk(frame)
             self.label_video.configure(image=tkimage)
             self.label_video.image = tkimage
         else:
-            self.cap.release()
+            nombre_dispositivo = self.dispositivo_actual.get()
+            liberar_camara(self.cap)
+            self.cap = None
+            self.id_conexion_vigente += 1  # invalida cualquier conexion en curso para este dispositivo
+            self.mostrar_estado(
+                f"Se perdio la conexion con '{nombre_dispositivo}'. Presiona el dispositivo para reintentar.",
+                "red",
+            )
 
         self.root.after(1, self.actualizar_video)
 
     def cerrar(self):
-        self.cap.release()
+        if self.cap is not None:
+            liberar_camara(self.cap)
         self.root.destroy()
 
 
